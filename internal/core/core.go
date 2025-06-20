@@ -14,6 +14,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/bluenviron/gortsplib/v4"
+	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/api"
@@ -27,6 +28,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/pprof"
 	"github.com/bluenviron/mediamtx/internal/recordcleaner"
 	"github.com/bluenviron/mediamtx/internal/rlimit"
+	internalSentry "github.com/bluenviron/mediamtx/internal/sentry"
 	"github.com/bluenviron/mediamtx/internal/servers/hls"
 	"github.com/bluenviron/mediamtx/internal/servers/rtmp"
 	"github.com/bluenviron/mediamtx/internal/servers/rtsp"
@@ -68,6 +70,7 @@ type Core struct {
 	confPath        string
 	conf            *conf.Conf
 	logger          *logger.Logger
+	sentryManager   *internalSentry.Manager
 	externalCmdPool *externalcmd.Pool
 	authManager     *auth.Manager
 	metrics         *metrics.Metrics
@@ -165,6 +168,13 @@ func (p *Core) Wait() {
 // Log implements logger.Writer.
 func (p *Core) Log(level logger.Level, format string, args ...interface{}) {
 	p.logger.Log(level, format, args...)
+
+	if p.sentryManager != nil && level == logger.Error {
+		message := fmt.Sprintf(format, args...)
+		p.sentryManager.CaptureMessage(message, sentry.LevelError, map[string]string{
+			"component": "core",
+		})
+	}
 }
 
 func (p *Core) run() {
@@ -233,6 +243,27 @@ func (p *Core) createResources(initial bool) error {
 		)
 		if err != nil {
 			return err
+		}
+	}
+
+	if p.sentryManager == nil {
+		if p.conf.SentryDSN != "" {
+			p.Log(logger.Info, "initializing Sentry with DSN: %s", p.conf.SentryDSN[:50]+"...")
+			p.sentryManager = internalSentry.NewManager()
+
+			// Add custom error filters from configuration
+			for _, errorPattern := range p.conf.SentryExcludeErrors {
+				p.sentryManager.AddErrorFilter("", errorPattern, "")
+			}
+
+			err = p.sentryManager.Initialize(p.conf.SentryDSN)
+			if err != nil {
+				p.Log(logger.Error, "failed to initialize Sentry: %s", err)
+				return err
+			}
+			p.Log(logger.Info, "Sentry initialized successfully")
+		} else {
+			p.Log(logger.Debug, "Sentry DSN not configured, skipping Sentry initialization")
 		}
 	}
 
@@ -401,6 +432,7 @@ func (p *Core) createResources(initial bool) error {
 			Metrics:             p.metrics,
 			PathManager:         p.pathManager,
 			Parent:              p,
+			SentryManager:       p.sentryManager,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -438,6 +470,7 @@ func (p *Core) createResources(initial bool) error {
 			Metrics:             p.metrics,
 			PathManager:         p.pathManager,
 			Parent:              p,
+			SentryManager:       p.sentryManager,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -465,6 +498,7 @@ func (p *Core) createResources(initial bool) error {
 			Metrics:             p.metrics,
 			PathManager:         p.pathManager,
 			Parent:              p,
+			SentryManager:       p.sentryManager,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -492,6 +526,7 @@ func (p *Core) createResources(initial bool) error {
 			Metrics:             p.metrics,
 			PathManager:         p.pathManager,
 			Parent:              p,
+			SentryManager:       p.sentryManager,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -521,6 +556,7 @@ func (p *Core) createResources(initial bool) error {
 			Metrics:         p.metrics,
 			PathManager:     p.pathManager,
 			Parent:          p,
+			SentryManager:   p.sentryManager,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -552,6 +588,7 @@ func (p *Core) createResources(initial bool) error {
 			Metrics:               p.metrics,
 			PathManager:           p.pathManager,
 			Parent:                p,
+			SentryManager:         p.sentryManager,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -931,6 +968,14 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if newConf == nil && p.externalCmdPool != nil {
 		p.Log(logger.Info, "waiting for running hooks")
 		p.externalCmdPool.Close()
+	}
+
+	closeSentry := newConf == nil ||
+		newConf.SentryDSN != p.conf.SentryDSN
+
+	if closeSentry && p.sentryManager != nil {
+		p.sentryManager.Close()
+		p.sentryManager = nil
 	}
 
 	if closeLogger && p.logger != nil {

@@ -23,6 +23,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	internalSentry "github.com/bluenviron/mediamtx/internal/sentry"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
@@ -93,6 +94,7 @@ type Server struct {
 	Metrics             serverMetrics
 	PathManager         serverPathManager
 	Parent              serverParent
+	SentryManager       *internalSentry.Manager
 
 	ctx       context.Context
 	ctxCancel func()
@@ -235,6 +237,7 @@ func (s *Server) OnConnOpen(ctx *gortsplib.ServerHandlerOnConnOpenCtx) {
 		rconn:               ctx.Conn,
 		rserver:             s.srv,
 		parent:              s,
+		sentryManager:       s.SentryManager,
 	}
 	c.initialize()
 	s.mutex.Lock()
@@ -276,6 +279,7 @@ func (s *Server) OnSessionOpen(ctx *gortsplib.ServerHandlerOnSessionOpenCtx) {
 		externalCmdPool: s.ExternalCmdPool,
 		pathManager:     s.PathManager,
 		parent:          s,
+		sentryManager:   s.SentryManager,
 	}
 	se.initialize()
 	s.mutex.Lock()

@@ -27,11 +27,13 @@ import (
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
+	internalSentry "github.com/bluenviron/mediamtx/internal/sentry"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
 const (
 	webrtcTurnSecretExpiration = 24 * time.Hour
+	webrtcPauseAfterAuthError  = 2 * time.Second
 )
 
 // ErrSessionNotFound is returned when a session is not found.
@@ -204,6 +206,7 @@ type Server struct {
 	Metrics               serverMetrics
 	PathManager           serverPathManager
 	Parent                serverParent
+	SentryManager         *internalSentry.Manager
 
 	ctx              context.Context
 	ctxCancel        func()
@@ -255,6 +258,7 @@ func (s *Server) Initialize() error {
 		readTimeout:    s.ReadTimeout,
 		pathManager:    s.PathManager,
 		parent:         s,
+		sentryManager:  s.SentryManager,
 	}
 	err := s.httpServer.initialize()
 	if err != nil {

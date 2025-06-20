@@ -162,6 +162,8 @@ type Conf struct {
 	LogDestinations     LogDestinations `json:"logDestinations"`
 	LogFile             string          `json:"logFile"`
 	SysLogPrefix        string          `json:"sysLogPrefix"`
+	SentryDSN           string          `json:"sentryDSN"`
+	SentryExcludeErrors []string        `json:"sentryExcludeErrors"`
 	ReadTimeout         Duration        `json:"readTimeout"`
 	WriteTimeout        Duration        `json:"writeTimeout"`
 	ReadBufferCount     *int            `json:"readBufferCount,omitempty"` // deprecated

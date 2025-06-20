@@ -19,6 +19,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
+	internalSentry "github.com/bluenviron/mediamtx/internal/sentry"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
@@ -87,6 +88,7 @@ type Server struct {
 	Metrics             serverMetrics
 	PathManager         serverPathManager
 	Parent              serverParent
+	SentryManager       *internalSentry.Manager
 
 	ctx       context.Context
 	ctxCancel func()
@@ -218,6 +220,7 @@ outer:
 				externalCmdPool:     s.ExternalCmdPool,
 				pathManager:         s.PathManager,
 				parent:              s,
+				sentryManager:       s.SentryManager,
 			}
 			c.initialize()
 			s.conns[c] = struct{}{}

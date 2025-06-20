@@ -12,6 +12,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	internalSentry "github.com/bluenviron/mediamtx/internal/sentry"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
@@ -62,6 +63,8 @@ type serverPathManager interface {
 	SetHLSServer(*Server) []defs.Path
 	FindPathConf(req defs.PathFindPathConfReq) (*conf.Path, error)
 	AddReader(req defs.PathAddReaderReq) (defs.Path, *stream.Stream, error)
+	OnPathSourceReady(defs.Path)
+	OnPathSourceNotReady(defs.Path)
 }
 
 type serverParent interface {
@@ -88,6 +91,7 @@ type Server struct {
 	Metrics         serverMetrics
 	PathManager     serverPathManager
 	Parent          serverParent
+	SentryManager   *internalSentry.Manager
 
 	ctx        context.Context
 	ctxCancel  func()
@@ -128,6 +132,7 @@ func (s *Server) Initialize() error {
 		readTimeout:    s.ReadTimeout,
 		pathManager:    s.PathManager,
 		parent:         s,
+		sentryManager:  s.SentryManager,
 	}
 	err := s.httpServer.initialize()
 	if err != nil {

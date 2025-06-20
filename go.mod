@@ -14,6 +14,7 @@ require (
 	github.com/bluenviron/mediacommon/v2 v2.2.0
 	github.com/datarhei/gosrt v0.9.0
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/getsentry/sentry-go v0.30.0
 	github.com/gin-contrib/pprof v1.5.3
 	github.com/gin-gonic/gin v1.10.1
 	github.com/go-git/go-billy/v5 v5.6.2

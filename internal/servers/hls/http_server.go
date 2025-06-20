@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/auth"
@@ -17,6 +18,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/httpp"
 	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
+	internalSentry "github.com/bluenviron/mediamtx/internal/sentry"
 )
 
 //go:generate go run ./hlsjsdownloader
@@ -45,6 +47,7 @@ type httpServer struct {
 	readTimeout    conf.Duration
 	pathManager    serverPathManager
 	parent         *Server
+	sentryManager  *internalSentry.Manager
 
 	inner *httpp.Server
 }
@@ -54,6 +57,11 @@ func (s *httpServer) initialize() error {
 	router.SetTrustedProxies(s.trustedProxies.ToTrustedProxies()) //nolint:errcheck
 
 	router.Use(s.middlewareOrigin)
+
+	// Add Sentry tracing middleware
+	if s.sentryManager != nil {
+		router.Use(s.middlewareSentryTracing)
+	}
 
 	router.Use(s.onRequest)
 
@@ -98,6 +106,47 @@ func (s *httpServer) middlewareOrigin(ctx *gin.Context) {
 		ctx.AbortWithStatus(http.StatusNoContent)
 		return
 	}
+}
+
+// middlewareSentryTracing adds Sentry transaction tracing for HTTP requests
+func (s *httpServer) middlewareSentryTracing(ctx *gin.Context) {
+	if s.sentryManager == nil {
+		ctx.Next()
+		return
+	}
+
+	startTime := time.Now()
+	userAgent := ctx.Request.UserAgent()
+	remoteAddr := httpp.RemoteAddr(ctx)
+
+	// Start Sentry transaction
+	span := s.sentryManager.StartHTTPTransaction(ctx.Request.Context(), ctx.Request.Method, ctx.Request.URL.Path, userAgent, remoteAddr)
+	if span != nil {
+		defer func() {
+			responseTime := time.Since(startTime).Nanoseconds() / 1000000 // Convert to milliseconds
+			statusCode := ctx.Writer.Status()
+
+			s.sentryManager.TraceHTTPRequest(span, ctx.Request.Method, ctx.Request.URL.Path, userAgent, statusCode, responseTime, map[string]interface{}{
+				"query":        ctx.Request.URL.RawQuery,
+				"content_type": ctx.Request.Header.Get("Content-Type"),
+				"referer":      ctx.Request.Header.Get("Referer"),
+				"protocol":     "HLS",
+			})
+
+			s.sentryManager.AddBreadcrumb("HLS HTTP request", "http_request", sentry.LevelInfo, map[string]interface{}{
+				"method":        ctx.Request.Method,
+				"path":          ctx.Request.URL.Path,
+				"status_code":   statusCode,
+				"response_time": responseTime,
+				"user_agent":    userAgent,
+				"remote_addr":   remoteAddr,
+			})
+
+			span.Finish()
+		}()
+	}
+
+	ctx.Next()
 }
 
 func (s *httpServer) onRequest(ctx *gin.Context) {

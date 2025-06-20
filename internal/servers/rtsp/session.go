@@ -11,6 +11,7 @@ import (
 	"github.com/bluenviron/gortsplib/v4"
 	rtspauth "github.com/bluenviron/gortsplib/v4/pkg/auth"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/auth"
@@ -21,6 +22,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/hooks"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/rtsp"
+	internalSentry "github.com/bluenviron/mediamtx/internal/sentry"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
@@ -33,6 +35,7 @@ type session struct {
 	externalCmdPool *externalcmd.Pool
 	pathManager     serverPathManager
 	parent          logger.Writer
+	sentryManager   *internalSentry.Manager
 
 	uuid            uuid.UUID
 	created         time.Time
@@ -47,11 +50,45 @@ type session struct {
 	packetsLost     *counterdumper.CounterDumper
 	decodeErrors    *counterdumper.CounterDumper
 	discardedFrames *counterdumper.CounterDumper
+	sentrySpan      *sentry.Span
+	sessionID       string
 }
 
 func (s *session) initialize() {
 	s.uuid = uuid.New()
 	s.created = time.Now()
+	s.sessionID = hex.EncodeToString(s.uuid[:4])
+
+	if s.sentryManager != nil {
+		connType := "rtsp"
+		if s.isTLS {
+			connType = "rtsps"
+		}
+
+		remoteAddr := s.rconn.NetConn().RemoteAddr().String()
+
+		s.sentrySpan = s.sentryManager.StartConnectionTrace(
+			s.sessionID,
+			connType,
+			remoteAddr,
+		)
+
+		s.sentryManager.SetUser(s.sessionID, "", s.rconn.NetConn().RemoteAddr().(*net.TCPAddr).IP.String())
+
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "session_created", map[string]interface{}{
+			"session_id":  s.sessionID,
+			"remote_addr": remoteAddr,
+			"tls":         s.isTLS,
+			"transports":  fmt.Sprintf("%v", s.transports),
+			"created_at":  s.created.Format(time.RFC3339),
+		})
+
+		s.sentryManager.AddBreadcrumb("RTSP session created", "rtsp_session", sentry.LevelInfo, map[string]interface{}{
+			"session_id":  s.sessionID,
+			"remote_addr": remoteAddr,
+			"tls":         s.isTLS,
+		})
+	}
 
 	s.packetsLost = &counterdumper.CounterDumper{
 		OnReport: func(val uint64) {
@@ -63,6 +100,19 @@ func (s *session) initialize() {
 					}
 					return "packets"
 				}())
+
+			if s.sentryManager != nil {
+				s.sentryManager.TraceConnectionEvent(s.sentrySpan, "packets_lost", map[string]interface{}{
+					"session_id":    s.sessionID,
+					"packets_count": val,
+					"path":          s.pathName,
+				})
+
+				s.sentryManager.AddBreadcrumb("RTP packets lost", "rtsp_session", sentry.LevelWarning, map[string]interface{}{
+					"session_id":    s.sessionID,
+					"packets_count": val,
+				})
+			}
 		},
 	}
 	s.packetsLost.Start()
@@ -77,6 +127,22 @@ func (s *session) initialize() {
 					}
 					return "errors"
 				}())
+
+			if s.sentryManager != nil {
+				s.sentryManager.TraceConnectionEvent(s.sentrySpan, "decode_errors", map[string]interface{}{
+					"session_id":   s.sessionID,
+					"errors_count": val,
+					"path":         s.pathName,
+				})
+
+				s.sentryManager.CaptureMessage(fmt.Sprintf("Decode errors in session %s: %d", s.sessionID, val),
+					sentry.LevelWarning, map[string]string{
+						"component":   "rtsp_session",
+						"session_id":  s.sessionID,
+						"path":        s.pathName,
+						"remote_addr": s.rconn.NetConn().RemoteAddr().String(),
+					})
+			}
 		},
 	}
 	s.decodeErrors.Start()
@@ -91,6 +157,23 @@ func (s *session) initialize() {
 					}
 					return "frames"
 				}())
+
+			if s.sentryManager != nil {
+				s.sentryManager.TraceConnectionEvent(s.sentrySpan, "frames_discarded", map[string]interface{}{
+					"session_id":   s.sessionID,
+					"frames_count": val,
+					"path":         s.pathName,
+					"reason":       "connection_too_slow",
+				})
+
+				s.sentryManager.CaptureMessage(fmt.Sprintf("Slow connection - discarded %d frames in session %s", val, s.sessionID),
+					sentry.LevelWarning, map[string]string{
+						"component":   "rtsp_session",
+						"session_id":  s.sessionID,
+						"path":        s.pathName,
+						"remote_addr": s.rconn.NetConn().RemoteAddr().String(),
+					})
+			}
 		},
 	}
 	s.discardedFrames.Start()
@@ -112,8 +195,25 @@ func (s *session) remoteAddr() net.Addr {
 
 // Log implements logger.Writer.
 func (s *session) Log(level logger.Level, format string, args ...interface{}) {
-	id := hex.EncodeToString(s.uuid[:4])
-	s.parent.Log(level, "[session %s] "+format, append([]interface{}{id}, args...)...)
+	message := fmt.Sprintf(format, args...)
+	s.parent.Log(level, "[session %s] "+format, append([]interface{}{s.sessionID}, args...)...)
+
+	if s.sentryManager != nil {
+		if level == logger.Error {
+			s.sentryManager.CaptureMessage(message, sentry.LevelError, map[string]string{
+				"component":   "rtsp_session",
+				"session_id":  s.sessionID,
+				"path":        s.pathName,
+				"remote_addr": s.rconn.NetConn().RemoteAddr().String(),
+			})
+		}
+
+		s.sentryManager.AddBreadcrumb(message, "rtsp_session", sentry.LevelInfo, map[string]interface{}{
+			"session_id": s.sessionID,
+			"level":      fmt.Sprintf("%d", level),
+			"path":       s.pathName,
+		})
+	}
 }
 
 // onClose is called by rtspServer.
@@ -133,17 +233,69 @@ func (s *session) onClose(err error) {
 	s.path = nil
 	s.stream = nil
 
+	if s.sentryManager != nil && s.sentrySpan != nil {
+		duration := time.Since(s.created)
+
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "session_closed", map[string]interface{}{
+			"session_id":  s.sessionID,
+			"duration_ms": duration.Milliseconds(),
+			"final_state": s.rsession.State().String(),
+			"path":        s.pathName,
+			"error":       err.Error(),
+		})
+
+		s.sentrySpan.SetData("session_duration_ms", duration.Milliseconds())
+		s.sentrySpan.SetData("final_state", s.rsession.State().String())
+		s.sentrySpan.SetData("path", s.pathName)
+
+		if err != nil {
+			s.sentryManager.CaptureError(err, map[string]string{
+				"component":   "rtsp_session",
+				"session_id":  s.sessionID,
+				"path":        s.pathName,
+				"remote_addr": s.rconn.NetConn().RemoteAddr().String(),
+				"event":       "session_close",
+			})
+		}
+
+		s.sentrySpan.Finish()
+	}
+
 	s.Log(logger.Info, "destroyed: %v", err)
 }
 
 // onAnnounce is called by rtspServer.
 func (s *session) onAnnounce(c *conn, ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
 	if len(ctx.Path) == 0 || ctx.Path[0] != '/' {
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "announce_error", map[string]interface{}{
+				"session_id": s.sessionID,
+				"error":      "invalid_path",
+				"path":       ctx.Path,
+			})
+		}
 		return &base.Response{
 			StatusCode: base.StatusBadRequest,
 		}, fmt.Errorf("invalid path")
 	}
 	ctx.Path = ctx.Path[1:]
+
+	if s.sentryManager != nil {
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "announce_started", map[string]interface{}{
+			"session_id":   s.sessionID,
+			"path":         ctx.Path,
+			"query":        ctx.Query,
+			"remote_addr":  s.rconn.NetConn().RemoteAddr().String(),
+			"content_type": ctx.Request.Header["Content-Type"],
+			"user_agent":   ctx.Request.Header["User-Agent"],
+		})
+
+		s.sentryManager.AddBreadcrumb("RTSP ANNOUNCE started", "rtsp_action", sentry.LevelInfo, map[string]interface{}{
+			"session_id": s.sessionID,
+			"path":       ctx.Path,
+			"action":     "ANNOUNCE",
+		})
+	}
 
 	// CustomVerifyFunc prevents hashed credentials from working.
 	// Use it only when strictly needed.
@@ -154,13 +306,15 @@ func (s *session) onAnnounce(c *conn, ctx *gortsplib.ServerHandlerOnAnnounceCtx)
 		}
 	}
 
+	credentials := rtsp.Credentials(ctx.Request)
+
 	req := defs.PathAccessRequest{
 		Name:             ctx.Path,
 		Query:            ctx.Query,
 		Publish:          true,
 		Proto:            auth.ProtocolRTSP,
 		ID:               &c.uuid,
-		Credentials:      rtsp.Credentials(ctx.Request),
+		Credentials:      credentials,
 		IP:               c.ip(),
 		CustomVerifyFunc: customVerifyFunc,
 	}
@@ -170,6 +324,23 @@ func (s *session) onAnnounce(c *conn, ctx *gortsplib.ServerHandlerOnAnnounceCtx)
 		AccessRequest: req,
 	})
 	if err != nil {
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "announce_failed", map[string]interface{}{
+				"session_id": s.sessionID,
+				"path":       ctx.Path,
+				"error":      err.Error(),
+				"username":   credentials.User,
+			})
+
+			s.sentryManager.CaptureError(err, map[string]string{
+				"component":  "rtsp_session",
+				"session_id": s.sessionID,
+				"path":       ctx.Path,
+				"action":     "ANNOUNCE",
+				"username":   credentials.User,
+			})
+		}
+
 		var terr auth.Error
 		if errors.As(err, &terr) {
 			return c.handleAuthError(ctx.Request)
@@ -188,6 +359,23 @@ func (s *session) onAnnounce(c *conn, ctx *gortsplib.ServerHandlerOnAnnounceCtx)
 	s.query = ctx.Query
 	s.mutex.Unlock()
 
+	if s.sentryManager != nil {
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "announce_success", map[string]interface{}{
+			"session_id": s.sessionID,
+			"path":       ctx.Path,
+			"state":      "PreRecord",
+			"username":   credentials.User,
+		})
+
+		s.sentryManager.SetUser(s.sessionID, credentials.User, s.rconn.NetConn().RemoteAddr().(*net.TCPAddr).IP.String())
+
+		s.sentryManager.AddBreadcrumb("RTSP ANNOUNCE successful", "rtsp_action", sentry.LevelInfo, map[string]interface{}{
+			"session_id": s.sessionID,
+			"path":       ctx.Path,
+			"username":   credentials.User,
+		})
+	}
+
 	return &base.Response{
 		StatusCode: base.StatusOK,
 	}, nil
@@ -197,11 +385,35 @@ func (s *session) onAnnounce(c *conn, ctx *gortsplib.ServerHandlerOnAnnounceCtx)
 func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
 ) (*base.Response, *gortsplib.ServerStream, error) {
 	if len(ctx.Path) == 0 || ctx.Path[0] != '/' {
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "setup_error", map[string]interface{}{
+				"session_id": s.sessionID,
+				"error":      "invalid_path",
+				"path":       ctx.Path,
+			})
+		}
 		return &base.Response{
 			StatusCode: base.StatusBadRequest,
 		}, nil, fmt.Errorf("invalid path")
 	}
 	ctx.Path = ctx.Path[1:]
+
+	if s.sentryManager != nil {
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "setup_started", map[string]interface{}{
+			"session_id": s.sessionID,
+			"path":       ctx.Path,
+			"query":      ctx.Query,
+			"transport":  ctx.Transport.String(),
+			"state":      s.rsession.State().String(),
+		})
+
+		s.sentryManager.AddBreadcrumb("RTSP SETUP started", "rtsp_action", sentry.LevelInfo, map[string]interface{}{
+			"session_id": s.sessionID,
+			"path":       ctx.Path,
+			"transport":  ctx.Transport.String(),
+			"action":     "SETUP",
+		})
+	}
 
 	// in case the client is setupping a stream with UDP or UDP-multicast, and these
 	// transport protocols are disabled, gortsplib already blocks the request.
@@ -209,6 +421,14 @@ func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
 	// and it is disabled.
 	if ctx.Transport == gortsplib.TransportTCP {
 		if _, ok := s.transports[gortsplib.TransportTCP]; !ok {
+			if s.sentryManager != nil {
+				s.sentryManager.TraceConnectionEvent(s.sentrySpan, "setup_failed", map[string]interface{}{
+					"session_id": s.sessionID,
+					"path":       ctx.Path,
+					"error":      "unsupported_transport_tcp",
+					"transport":  "TCP",
+				})
+			}
 			return &base.Response{
 				StatusCode: base.StatusUnsupportedTransport,
 			}, nil, nil
@@ -217,12 +437,14 @@ func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
 
 	switch s.rsession.State() {
 	case gortsplib.ServerSessionStateInitial, gortsplib.ServerSessionStatePrePlay: // play
+		credentials := rtsp.Credentials(ctx.Request)
+
 		req := defs.PathAccessRequest{
 			Name:        ctx.Path,
 			Query:       ctx.Query,
 			Proto:       auth.ProtocolRTSP,
 			ID:          &c.uuid,
-			Credentials: rtsp.Credentials(ctx.Request),
+			Credentials: credentials,
 			IP:          c.ip(),
 			CustomVerifyFunc: func(expectedUser, expectedPass string) bool {
 				return c.rconn.VerifyCredentials(ctx.Request, expectedUser, expectedPass)
@@ -234,6 +456,23 @@ func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
 			AccessRequest: req,
 		})
 		if err != nil {
+			if s.sentryManager != nil {
+				s.sentryManager.TraceConnectionEvent(s.sentrySpan, "setup_reader_failed", map[string]interface{}{
+					"session_id": s.sessionID,
+					"path":       ctx.Path,
+					"error":      err.Error(),
+					"username":   credentials.User,
+				})
+
+				s.sentryManager.CaptureError(err, map[string]string{
+					"component":  "rtsp_session",
+					"session_id": s.sessionID,
+					"path":       ctx.Path,
+					"action":     "SETUP_READ",
+					"username":   credentials.User,
+				})
+			}
+
 			var terr auth.Error
 			if errors.As(err, &terr) {
 				res, err2 := c.handleAuthError(ctx.Request)
@@ -261,6 +500,17 @@ func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
 		s.query = ctx.Query
 		s.mutex.Unlock()
 
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "setup_reader_success", map[string]interface{}{
+				"session_id": s.sessionID,
+				"path":       ctx.Path,
+				"state":      "PrePlay",
+				"username":   credentials.User,
+			})
+
+			s.sentryManager.SetUser(s.sessionID, credentials.User, s.rconn.NetConn().RemoteAddr().(*net.TCPAddr).IP.String())
+		}
+
 		var rstream *gortsplib.ServerStream
 		if !s.isTLS {
 			rstream = stream.RTSPStream(s.rserver)
@@ -273,6 +523,14 @@ func (s *session) onSetup(c *conn, ctx *gortsplib.ServerHandlerOnSetupCtx,
 		}, rstream, nil
 
 	default: // record
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "setup_publisher_success", map[string]interface{}{
+				"session_id": s.sessionID,
+				"path":       ctx.Path,
+				"state":      s.rsession.State().String(),
+			})
+		}
+
 		return &base.Response{
 			StatusCode: base.StatusOK,
 		}, nil, nil
@@ -288,6 +546,27 @@ func (s *session) onPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, e
 			s.path.Name(),
 			s.rsession.SetuppedTransport(),
 			defs.MediasInfo(s.rsession.SetuppedMedias()))
+
+		if s.sentryManager != nil {
+			medias := s.rsession.SetuppedMedias()
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "play_started", map[string]interface{}{
+				"session_id":  s.sessionID,
+				"path":        s.path.Name(),
+				"transport":   s.rsession.SetuppedTransport().String(),
+				"media_count": len(medias),
+				"medias_info": defs.MediasInfo(medias),
+				"query":       s.rsession.SetuppedQuery(),
+				"state":       "Play",
+			})
+
+			s.sentryManager.AddBreadcrumb("RTSP PLAY started", "rtsp_action", sentry.LevelInfo, map[string]interface{}{
+				"session_id":  s.sessionID,
+				"path":        s.path.Name(),
+				"transport":   s.rsession.SetuppedTransport().String(),
+				"media_count": len(medias),
+				"action":      "PLAY",
+			})
+		}
 
 		s.onUnreadHook = hooks.OnRead(hooks.OnReadParams{
 			Logger:          s,
@@ -312,12 +591,46 @@ func (s *session) onPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, e
 
 // onRecord is called by rtspServer.
 func (s *session) onRecord(_ *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
+	if s.sentryManager != nil {
+		desc := s.rsession.AnnouncedDescription()
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "record_started", map[string]interface{}{
+			"session_id":  s.sessionID,
+			"path":        s.pathName,
+			"media_count": len(desc.Medias),
+			"medias_info": defs.MediasInfo(desc.Medias),
+			"transport":   s.rsession.SetuppedTransport().String(),
+			"state":       "Record",
+		})
+
+		s.sentryManager.AddBreadcrumb("RTSP RECORD started", "rtsp_action", sentry.LevelInfo, map[string]interface{}{
+			"session_id":  s.sessionID,
+			"path":        s.pathName,
+			"media_count": len(desc.Medias),
+			"action":      "RECORD",
+		})
+	}
+
 	stream, err := s.path.StartPublisher(defs.PathStartPublisherReq{
 		Author:             s,
 		Desc:               s.rsession.AnnouncedDescription(),
 		GenerateRTPPackets: false,
 	})
 	if err != nil {
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "record_failed", map[string]interface{}{
+				"session_id": s.sessionID,
+				"path":       s.pathName,
+				"error":      err.Error(),
+			})
+
+			s.sentryManager.CaptureError(err, map[string]string{
+				"component":  "rtsp_session",
+				"session_id": s.sessionID,
+				"path":       s.pathName,
+				"action":     "RECORD",
+			})
+		}
+
 		return &base.Response{
 			StatusCode: base.StatusBadRequest,
 		}, err
@@ -337,6 +650,14 @@ func (s *session) onRecord(_ *gortsplib.ServerHandlerOnRecordCtx) (*base.Respons
 	s.transport = s.rsession.SetuppedTransport()
 	s.mutex.Unlock()
 
+	if s.sentryManager != nil {
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "record_success", map[string]interface{}{
+			"session_id": s.sessionID,
+			"path":       s.pathName,
+			"transport":  s.rsession.SetuppedTransport().String(),
+		})
+	}
+
 	return &base.Response{
 		StatusCode: base.StatusOK,
 	}, nil
@@ -344,7 +665,24 @@ func (s *session) onRecord(_ *gortsplib.ServerHandlerOnRecordCtx) (*base.Respons
 
 // onPause is called by rtspServer.
 func (s *session) onPause(_ *gortsplib.ServerHandlerOnPauseCtx) (*base.Response, error) {
-	switch s.rsession.State() {
+	currentState := s.rsession.State()
+
+	if s.sentryManager != nil {
+		s.sentryManager.TraceConnectionEvent(s.sentrySpan, "pause_started", map[string]interface{}{
+			"session_id":    s.sessionID,
+			"path":          s.pathName,
+			"current_state": currentState.String(),
+		})
+
+		s.sentryManager.AddBreadcrumb("RTSP PAUSE", "rtsp_action", sentry.LevelInfo, map[string]interface{}{
+			"session_id": s.sessionID,
+			"path":       s.pathName,
+			"state":      currentState.String(),
+			"action":     "PAUSE",
+		})
+	}
+
+	switch currentState {
 	case gortsplib.ServerSessionStatePlay:
 		s.onUnreadHook()
 
@@ -352,12 +690,28 @@ func (s *session) onPause(_ *gortsplib.ServerHandlerOnPauseCtx) (*base.Response,
 		s.state = gortsplib.ServerSessionStatePrePlay
 		s.mutex.Unlock()
 
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "pause_play_stopped", map[string]interface{}{
+				"session_id": s.sessionID,
+				"path":       s.pathName,
+				"new_state":  "PrePlay",
+			})
+		}
+
 	case gortsplib.ServerSessionStateRecord:
 		s.path.StopPublisher(defs.PathStopPublisherReq{Author: s})
 
 		s.mutex.Lock()
 		s.state = gortsplib.ServerSessionStatePreRecord
 		s.mutex.Unlock()
+
+		if s.sentryManager != nil {
+			s.sentryManager.TraceConnectionEvent(s.sentrySpan, "pause_record_stopped", map[string]interface{}{
+				"session_id": s.sessionID,
+				"path":       s.pathName,
+				"new_state":  "PreRecord",
+			})
+		}
 	}
 
 	return &base.Response{
